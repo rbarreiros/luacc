@@ -72,7 +72,7 @@ end,
 --------------------
 -- The MIT License (MIT)
 
--- Copyright (c) 2013 - 2015 Peter Melnichenko
+-- Copyright (c) 2013 - 2018 Peter Melnichenko
 
 -- Permission is hereby granted, free of charge, to any person obtaining a copy of
 -- this software and associated documentation files (the "Software"), to deal in
@@ -120,7 +120,7 @@ local function class(prototype, properties, parent)
    if properties then
       local names = {}
 
-      -- Create setter methods and fill set of property names. 
+      -- Create setter methods and fill set of property names.
       for _, property in ipairs(properties) do
          local name, callback = property[1], property[2]
 
@@ -304,6 +304,7 @@ local Parser = class({
    _options = {},
    _commands = {},
    _mutexes = {},
+   _groups = {},
    _require_command = true,
    _handle_options = true
 }, {
@@ -317,6 +318,12 @@ local Parser = class({
    typechecked("handle_options", "boolean"),
    typechecked("action", "function"),
    typechecked("command_target", "string"),
+   typechecked("help_vertical_space", "number"),
+   typechecked("usage_margin", "number"),
+   typechecked("usage_max_width", "number"),
+   typechecked("help_usage_margin", "number"),
+   typechecked("help_description_margin", "number"),
+   typechecked("help_max_width", "number"),
    add_help
 })
 
@@ -334,6 +341,13 @@ local Command = class({
    typechecked("handle_options", "boolean"),
    typechecked("action", "function"),
    typechecked("command_target", "string"),
+   typechecked("help_vertical_space", "number"),
+   typechecked("usage_margin", "number"),
+   typechecked("usage_max_width", "number"),
+   typechecked("help_usage_margin", "number"),
+   typechecked("help_description_margin", "number"),
+   typechecked("help_max_width", "number"),
+   typechecked("hidden", "boolean"),
    add_help
 }, Parser)
 
@@ -355,6 +369,7 @@ local Argument = class({
    typechecked("defmode", "string"),
    typechecked("show_default", "boolean"),
    typechecked("argname", "string", "table"),
+   typechecked("hidden", "boolean"),
    option_action,
    option_init
 })
@@ -376,9 +391,28 @@ local Option = class({
    typechecked("show_default", "boolean"),
    typechecked("overwrite", "boolean"),
    typechecked("argname", "string", "table"),
+   typechecked("hidden", "boolean"),
    option_action,
    option_init
 }, Argument)
+
+function Parser:_inherit_property(name, default)
+   local element = self
+
+   while true do
+      local value = element["_" .. name]
+
+      if value ~= nil then
+         return value
+      end
+
+      if not element._parent then
+         return default
+      end
+
+      element = element._parent
+   end
+end
 
 function Argument:_get_argument_list()
    local buf = {}
@@ -494,7 +528,7 @@ function Argument:_get_action()
    return action, init
 end
 
--- Returns placeholder for `narg`-th argument. 
+-- Returns placeholder for `narg`-th argument.
 function Argument:_get_argname(narg)
    local argname = self._argname or self:_get_default_argname()
 
@@ -513,26 +547,43 @@ function Option:_get_default_argname()
    return "<" .. self:_get_default_target() .. ">"
 end
 
--- Returns label to be shown in the help message. 
-function Argument:_get_label()
-   return self._name
+-- Returns labels to be shown in the help message.
+function Argument:_get_label_lines()
+   return {self._name}
 end
 
-function Option:_get_label()
-   local variants = {}
+function Option:_get_label_lines()
    local argument_list = self:_get_argument_list()
-   table.insert(argument_list, 1, nil)
 
-   for _, alias in ipairs(self._aliases) do
-      argument_list[1] = alias
-      table.insert(variants, table.concat(argument_list, " "))
+   if #argument_list == 0 then
+      -- Don't put aliases for simple flags like `-h` on different lines.
+      return {table.concat(self._aliases, ", ")}
    end
 
-   return table.concat(variants, ", ")
+   local longest_alias_length = -1
+
+   for _, alias in ipairs(self._aliases) do
+      longest_alias_length = math.max(longest_alias_length, #alias)
+   end
+
+   local argument_list_repr = table.concat(argument_list, " ")
+   local lines = {}
+
+   for i, alias in ipairs(self._aliases) do
+      local line = (" "):rep(longest_alias_length - #alias) .. alias .. " " .. argument_list_repr
+
+      if i ~= #self._aliases then
+         line = line .. ","
+      end
+
+      table.insert(lines, line)
+   end
+
+   return lines
 end
 
-function Command:_get_label()
-   return table.concat(self._aliases, ", ")
+function Command:_get_label_lines()
+   return {table.concat(self._aliases, ", ")}
 end
 
 function Argument:_get_description()
@@ -643,17 +694,32 @@ function Parser:command(...)
 end
 
 function Parser:mutex(...)
-   local options = {...}
+   local elements = {...}
 
-   for i, option in ipairs(options) do
-      assert(getmetatable(option) == Option, ("bad argument #%d to 'mutex' (Option expected)"):format(i))
+   for i, element in ipairs(elements) do
+      local mt = getmetatable(element)
+      assert(mt == Option or mt == Argument, ("bad argument #%d to 'mutex' (Option or Argument expected)"):format(i))
    end
 
-   table.insert(self._mutexes, options)
+   table.insert(self._mutexes, elements)
    return self
 end
 
-local max_usage_width = 70
+function Parser:group(name, ...)
+   assert(type(name) == "string", ("bad argument #1 to 'group' (string expected, got %s)"):format(type(name)))
+
+   local group = {name = name, ...}
+
+   for i, element in ipairs(group) do
+      local mt = getmetatable(element)
+      assert(mt == Option or mt == Argument or mt == Command,
+         ("bad argument #%d to 'group' (Option or Argument or Command expected)"):format(i + 1))
+   end
+
+   table.insert(self._groups, group)
+   return self
+end
+
 local usage_welcome = "Usage: "
 
 function Parser:get_usage()
@@ -661,64 +727,120 @@ function Parser:get_usage()
       return self._usage
    end
 
+   local usage_margin = self:_inherit_property("usage_margin", #usage_welcome)
+   local max_usage_width = self:_inherit_property("usage_max_width", 70)
    local lines = {usage_welcome .. self:_get_fullname()}
 
    local function add(s)
       if #lines[#lines]+1+#s <= max_usage_width then
          lines[#lines] = lines[#lines] .. " " .. s
       else
-         lines[#lines+1] = (" "):rep(#usage_welcome) .. s
+         lines[#lines+1] = (" "):rep(usage_margin) .. s
       end
    end
 
-   -- This can definitely be refactored into something cleaner
-   local mutex_options = {}
-   local vararg_mutexes = {}
+   -- Normally options are before positional arguments in usage messages.
+   -- However, vararg options should be after, because they can't be reliable used
+   -- before a positional argument.
+   -- Mutexes come into play, too, and are shown as soon as possible.
+   -- Overall, output usages in the following order:
+   -- 1. Mutexes that don't have positional arguments or vararg options.
+   -- 2. Options that are not in any mutexes and are not vararg.
+   -- 3. Positional arguments - on their own or as a part of a mutex.
+   -- 4. Remaining mutexes.
+   -- 5. Remaining options.
 
-   -- First, put mutexes which do not contain vararg options and remember those which do
-   for _, mutex in ipairs(self._mutexes) do
+   local elements_in_mutexes = {}
+   local added_elements = {}
+   local added_mutexes = {}
+   local argument_to_mutexes = {}
+
+   local function add_mutex(mutex, main_argument)
+      if added_mutexes[mutex] then
+         return
+      end
+
+      added_mutexes[mutex] = true
       local buf = {}
-      local is_vararg = false
 
-      for _, option in ipairs(mutex) do
-         if option:_is_vararg() then
-            is_vararg = true
+      for _, element in ipairs(mutex) do
+         if not element._hidden and not added_elements[element] then
+            if getmetatable(element) == Option or element == main_argument then
+               table.insert(buf, element:_get_usage())
+               added_elements[element] = true
+            end
+         end
+      end
+
+      if #buf == 1 then
+         add(buf[1])
+      elseif #buf > 1 then
+         add("(" .. table.concat(buf, " | ") .. ")")
+      end
+   end
+
+   local function add_element(element)
+      if not element._hidden and not added_elements[element] then
+         add(element:_get_usage())
+         added_elements[element] = true
+      end
+   end
+
+   for _, mutex in ipairs(self._mutexes) do
+      local is_vararg = false
+      local has_argument = false
+
+      for _, element in ipairs(mutex) do
+         if getmetatable(element) == Option then
+            if element:_is_vararg() then
+               is_vararg = true
+            end
+         else
+            has_argument = true
+            argument_to_mutexes[element] = argument_to_mutexes[element] or {}
+            table.insert(argument_to_mutexes[element], mutex)
          end
 
-         table.insert(buf, option:_get_usage())
-         mutex_options[option] = true
+         elements_in_mutexes[element] = true
       end
 
-      local repr = "(" .. table.concat(buf, " | ") .. ")"
-
-      if is_vararg then
-         table.insert(vararg_mutexes, repr)
-      else
-         add(repr)
+      if not is_vararg and not has_argument then
+         add_mutex(mutex)
       end
    end
 
-   -- Second, put regular options
    for _, option in ipairs(self._options) do
-      if not mutex_options[option] and not option:_is_vararg() then
-         add(option:_get_usage())
+      if not elements_in_mutexes[option] and not option:_is_vararg() then
+         add_element(option)
       end
    end
 
-   -- Put positional arguments
+   -- Add usages for positional arguments, together with one mutex containing them, if they are in a mutex.
    for _, argument in ipairs(self._arguments) do
-      add(argument:_get_usage())
+      -- Pick a mutex as a part of which to show this argument, take the first one that's still available.
+      local mutex
+
+      if elements_in_mutexes[argument] then
+         for _, argument_mutex in ipairs(argument_to_mutexes[argument]) do
+            if not added_mutexes[argument_mutex] then
+               mutex = argument_mutex
+            end
+         end
+      end
+
+      if mutex then
+         add_mutex(mutex, argument)
+      else
+         add_element(argument)
+      end
    end
 
-   -- Put mutexes containing vararg options
-   for _, mutex_repr in ipairs(vararg_mutexes) do
-      add(mutex_repr)
+   for _, mutex in ipairs(self._mutexes) do
+      add_mutex(mutex)
    end
 
    for _, option in ipairs(self._options) do
-      if not mutex_options[option] and option:_is_vararg() then
-         add(option:_get_usage())
-      end
+      add_element(option)
    end
 
    if #self._commands > 0 then
@@ -734,22 +856,173 @@ function Parser:get_usage()
    return table.concat(lines, "\n")
 end
 
-local margin_len = 3
-local margin_len2 = 25
-local margin = (" "):rep(margin_len)
-local margin2 = (" "):rep(margin_len2)
-
-local function make_two_columns(s1, s2)
-   if s2 == "" then
-      return margin .. s1
+local function split_lines(s)
+   if s == "" then
+      return {}
    end
 
-   s2 = s2:gsub("\n", "\n" .. margin2)
+   local lines = {}
 
-   if #s1 < (margin_len2-margin_len) then
-      return margin .. s1 .. (" "):rep(margin_len2-margin_len-#s1) .. s2
+   if s:sub(-1) ~= "\n" then
+      s = s .. "\n"
+   end
+
+   for line in s:gmatch("([^\n]*)\n") do
+      table.insert(lines, line)
+   end
+
+   return lines
+end
+
+local function autowrap_line(line, max_length)
+   -- Algorithm for splitting lines is simple and greedy.
+   local result_lines = {}
+
+   -- Preserve original indentation of the line, put this at the beginning of each result line.
+   -- If the first word looks like a list marker ('*', '+', or '-'), add spaces so that starts
+   -- of the second and the following lines vertically align with the start of the second word.
+   local indentation = line:match("^ *")
+
+   if line:find("^ *[%*%+%-]") then
+      indentation = indentation .. " " .. line:match("^ *[%*%+%-]( *)")
+   end
+
+   -- Parts of the last line being assembled.
+   local line_parts = {}
+
+   -- Length of the current line.
+   local line_length = 0
+
+   -- Index of the next character to consider.
+   local index = 1
+
+   while true do
+      local word_start, word_finish, word = line:find("([^ ]+)", index)
+
+      if not word_start then
+         -- Ignore trailing spaces, if any.
+         break
+      end
+
+      local preceding_spaces = line:sub(index, word_start - 1)
+      index = word_finish + 1
+
+      if (#line_parts == 0) or (line_length + #preceding_spaces + #word <= max_length) then
+         -- Either this is the very first word or it fits as an addition to the current line, add it.
+         table.insert(line_parts, preceding_spaces) -- For the very first word this adds the indentation.
+         table.insert(line_parts, word)
+         line_length = line_length + #preceding_spaces + #word
+      else
+         -- Does not fit, finish current line and put the word into a new one.
+         table.insert(result_lines, table.concat(line_parts))
+         line_parts = {indentation, word}
+         line_length = #indentation + #word
+      end
+   end
+
+   if #line_parts > 0 then
+      table.insert(result_lines, table.concat(line_parts))
+   end
+
+   if #result_lines == 0 then
+      -- Preserve empty lines.
+      result_lines[1] = ""
+   end
+
+   return result_lines
+end
+
+-- Automatically wraps lines within given array,
+-- attempting to limit line length to `max_length`.
+-- Existing line splits are preserved.
+local function autowrap(lines, max_length)
+   local result_lines = {}
+
+   for _, line in ipairs(lines) do
+      local autowrapped_lines = autowrap_line(line, max_length)
+
+      for _, autowrapped_line in ipairs(autowrapped_lines) do
+         table.insert(result_lines, autowrapped_line)
+      end
+   end
+
+   return result_lines
+end
+
+function Parser:_get_element_help(element)
+   local label_lines = element:_get_label_lines()
+   local description_lines = split_lines(element:_get_description())
+
+   local result_lines = {}
+
+   -- All label lines should have the same length (except the last one, it has no comma).
+   -- If too long, start description after all the label lines.
+   -- Otherwise, combine label and description lines.
+
+   local usage_margin_len = self:_inherit_property("help_usage_margin", 3)
+   local usage_margin = (" "):rep(usage_margin_len)
+   local description_margin_len = self:_inherit_property("help_description_margin", 25)
+   local description_margin = (" "):rep(description_margin_len)
+
+   local help_max_width = self:_inherit_property("help_max_width")
+
+   if help_max_width then
+      local description_max_width = math.max(help_max_width - description_margin_len, 10)
+      description_lines = autowrap(description_lines, description_max_width)
+   end
+
+   if #label_lines[1] >= (description_margin_len - usage_margin_len) then
+      for _, label_line in ipairs(label_lines) do
+         table.insert(result_lines, usage_margin .. label_line)
+      end
+
+      for _, description_line in ipairs(description_lines) do
+         table.insert(result_lines, description_margin .. description_line)
+      end
    else
-      return margin .. s1 .. "\n" .. margin2 .. s2
+      for i = 1, math.max(#label_lines, #description_lines) do
+         local label_line = label_lines[i]
+         local description_line = description_lines[i]
+
+         local line = ""
+
+         if label_line then
+            line = usage_margin .. label_line
+         end
+
+         if description_line and description_line ~= "" then
+            line = line .. (" "):rep(description_margin_len - #line) .. description_line
+         end
+
+         table.insert(result_lines, line)
+      end
+   end
+
+   return table.concat(result_lines, "\n")
+end
+
+local function get_group_types(group)
+   local types = {}
+
+   for _, element in ipairs(group) do
+      types[getmetatable(element)] = true
+   end
+
+   return types
+end
+
+function Parser:_add_group_help(blocks, added_elements, label, elements)
+   local buf = {label}
+
+   for _, element in ipairs(elements) do
+      if not element._hidden and not added_elements[element] then
+         added_elements[element] = true
+         table.insert(buf, self:_get_element_help(element))
+      end
+   end
+
+   if #buf > 1 then
+      table.insert(blocks, table.concat(buf, ("\n"):rep(self:_inherit_property("help_vertical_space", 0) + 1)))
    end
 end
 
@@ -759,27 +1032,72 @@ function Parser:get_help()
    end
 
    local blocks = {self:get_usage()}
-   
+
+   local help_max_width = self:_inherit_property("help_max_width")
+
    if self._description then
-      table.insert(blocks, self._description)
+      local description = self._description
+
+      if help_max_width then
+         description = table.concat(autowrap(split_lines(description), help_max_width), "\n")
+      end
+
+      table.insert(blocks, description)
    end
 
-   local labels = {"Arguments:", "Options:", "Commands:"}
+   -- 1. Put groups containing arguments first, then other arguments.
+   -- 2. Put remaining groups containing options, then other options.
+   -- 3. Put remaining groups containing commands, then other commands.
+   -- Assume that an element can't be in several groups.
+   local groups_by_type = {
+      [Argument] = {},
+      [Option] = {},
+      [Command] = {}
+   }
 
-   for i, elements in ipairs{self._arguments, self._options, self._commands} do
-      if #elements > 0 then
-         local buf = {labels[i]}
+   for _, group in ipairs(self._groups) do
+      local group_types = get_group_types(group)
 
-         for _, element in ipairs(elements) do
-            table.insert(buf, make_two_columns(element:_get_label(), element:_get_description()))
+      for _, mt in ipairs({Argument, Option, Command}) do
+         if group_types[mt] then
+            table.insert(groups_by_type[mt], group)
+            break
          end
-
-         table.insert(blocks, table.concat(buf, "\n"))
       end
    end
 
+   local default_groups = {
+      {name = "Arguments", type = Argument, elements = self._arguments},
+      {name = "Options", type = Option, elements = self._options},
+      {name = "Commands", type = Command, elements = self._commands}
+   }
+
+   local added_elements = {}
+
+   for _, default_group in ipairs(default_groups) do
+      local type_groups = groups_by_type[default_group.type]
+
+      for _, group in ipairs(type_groups) do
+         self:_add_group_help(blocks, added_elements, group.name .. ":", group)
+      end
+
+      local default_label = default_group.name .. ":"
+
+      if #type_groups > 0 then
+         default_label = "Other " .. default_label:gsub("^.", string.lower)
+      end
+
+      self:_add_group_help(blocks, added_elements, default_label, default_group.elements)
+   end
+
    if self._epilog then
-      table.insert(blocks, self._epilog)
+      local epilog = self._epilog
+
+      if help_max_width then
+         epilog = table.concat(autowrap(split_lines(epilog), help_max_width), "\n")
+      end
+
+      table.insert(blocks, epilog)
    end
 
    return table.concat(blocks, "\n\n")
@@ -853,7 +1171,7 @@ function ElementState:error(fmt, ...)
    self.state:error(fmt, ...)
 end
 
-function ElementState:convert(argument)
+function ElementState:convert(argument, index)
    local converter = self.element._convert
 
    if converter then
@@ -861,6 +1179,8 @@ function ElementState:convert(argument)
 
       if type(converter) == "function" then
          ok, err = converter(argument)
+      elseif type(converter[index]) == "function" then
+         ok, err = converter[index](argument)
       else
          ok = converter[argument]
       end
@@ -890,16 +1210,20 @@ local function bound(noun, min, max, is_max)
    return res .. tostring(number) .. " " .. noun ..  (number == 1 and "" or "s")
 end
 
-function ElementState:invoke(alias)
-   self.open = true
+function ElementState:set_name(alias)
    self.name = ("%s '%s'"):format(alias and "option" or "argument", alias or self.element._name)
+end
+
+function ElementState:invoke()
+   self.open = true
    self.overwrite = false
 
    if self.invocations >= self.element._maxcount then
       if self.element._overwrite then
          self.overwrite = true
       else
-         self:error("%s must be used %s", self.name, bound("time", self.element._mincount, self.element._maxcount, true))
+         local num_times_repr = bound("time", self.element._mincount, self.element._maxcount, true)
+         self:error("%s must be used %s", self.name, num_times_repr)
       end
    else
       self.invocations = self.invocations + 1
@@ -915,7 +1239,7 @@ function ElementState:invoke(alias)
 end
 
 function ElementState:pass(argument)
-   argument = self:convert(argument)
+   argument = self:convert(argument, #self.args + 1)
    table.insert(self.args, argument)
 
    if #self.args >= self.element._maxargs then
@@ -951,13 +1275,17 @@ function ElementState:close()
          end
       end
 
-      local args = self.args
+      local args
 
-      if self.element._maxargs <= 1 then
-         args = args[1]
-      end
-
-      if self.element._maxargs == 1 and self.element._minargs == 0 and self.element._mincount ~= self.element._maxcount then
+      if self.element._maxargs == 0 then
+         args = self.args[1]
+      elseif self.element._maxargs == 1 then
+         if self.element._minargs == 0 and self.element._mincount ~= self.element._maxcount then
+            args = self.args
+         else
+            args = self.args[1]
+         end
+      else
          args = self.args
       end
 
@@ -971,7 +1299,7 @@ local ParseState = class({
    arguments = {},
    argument_i = 1,
    element_to_mutexes = {},
-   mutex_to_used_option = {},
+   mutex_to_element_state = {},
    command_actions = {}
 })
 
@@ -1004,18 +1332,19 @@ function ParseState:switch(parser)
    end
 
    for _, mutex in ipairs(parser._mutexes) do
-      for _, option in ipairs(mutex) do
-         if not self.element_to_mutexes[option] then
-            self.element_to_mutexes[option] = {}
+      for _, element in ipairs(mutex) do
+         if not self.element_to_mutexes[element] then
+            self.element_to_mutexes[element] = {}
          end
 
-         table.insert(self.element_to_mutexes[option], mutex)
+         table.insert(self.element_to_mutexes[element], mutex)
       end
    end
 
    for _, argument in ipairs(parser._arguments) do
       argument = ElementState(self, argument)
       table.insert(self.arguments, argument)
+      argument:set_name()
       argument:invoke()
    end
 
@@ -1054,22 +1383,26 @@ function ParseState:get_command(name)
    end
 end
 
-function ParseState:invoke(option, name)
-   self:close()
+function ParseState:check_mutexes(element_state)
+   if self.element_to_mutexes[element_state.element] then
+      for _, mutex in ipairs(self.element_to_mutexes[element_state.element]) do
+         local used_element_state = self.mutex_to_element_state[mutex]
 
-   if self.element_to_mutexes[option.element] then
-      for _, mutex in ipairs(self.element_to_mutexes[option.element]) do
-         local used_option = self.mutex_to_used_option[mutex]
-
-         if used_option and used_option ~= option then
-            self:error("option '%s' can not be used together with %s", name, used_option.name)
+         if used_element_state and used_element_state ~= element_state then
+            self:error("%s can not be used together with %s", element_state.name, used_element_state.name)
          else
-            self.mutex_to_used_option[mutex] = option
+            self.mutex_to_element_state[mutex] = element_state
          end
       end
    end
+end
 
-   if option:invoke(name) then
+function ParseState:invoke(option, name)
+   self:close()
+   option:set_name(name)
+   self:check_mutexes(option, name)
+
+   if option:invoke() then
       self.option = option
    end
 end
@@ -1080,6 +1413,8 @@ function ParseState:pass(arg)
          self.option = nil
       end
    elseif self.argument then
+      self:check_mutexes(self.argument)
+
       if not self.argument:pass(arg) then
          self.argument_i = self.argument_i + 1
          self.argument = self.arguments[self.argument_i]
@@ -1120,11 +1455,11 @@ function ParseState:finalize()
    end
 
    for _, option in ipairs(self.options) do
-      local name = option.name or ("option '%s'"):format(option.element._name)
+      option.name = option.name or ("option '%s'"):format(option.element._name)
 
       if option.invocations == 0 then
          if option:default("u") then
-            option:invoke(name)
+            option:invoke()
             option:complete_invocation()
             option:close()
          end
@@ -1135,13 +1470,13 @@ function ParseState:finalize()
       if option.invocations < mincount then
          if option:default("a") then
             while option.invocations < mincount do
-               option:invoke(name)
+               option:invoke()
                option:close()
             end
          elseif option.invocations == 0 then
-            self:error("missing %s", name)
+            self:error("missing %s", option.name)
          else
-            self:error("%s must be used %s", name, bound("time", mincount, option.element._maxcount))
+            self:error("%s must be used %s", option.name, bound("time", mincount, option.element._maxcount))
          end
       end
    end
@@ -1164,7 +1499,13 @@ function ParseState:parse(args)
 
                if arg:sub(2, 2) == first then
                   if #arg == 2 then
-                     self:close()
+                     if self.options[arg] then
+                        local option = self:get_option(arg)
+                        self:invoke(option, arg)
+                     else
+                        self:close()
+                     end
+
                      self.handle_options = false
                   else
                      local equals = arg:find "="
@@ -1247,9 +1588,15 @@ function Parser:pparse(args)
    end
 end
 
-return function(...)
+local argparse = {}
+
+argparse.version = "0.6.0"
+
+setmetatable(argparse, {__call = function(_, ...)
    return Parser(default_cmdline[0]):add_help(true)(...)
-end
+end})
+
+return argparse
 
 end,
 
@@ -1259,14 +1606,11 @@ end,
 --------------------
 local setmetatable = setmetatable
 local loadstring = loadstring
-local loadchunk
 local tostring = tostring
 local setfenv = setfenv
 local require = require
-local capture
 local concat = table.concat
 local assert = assert
-local prefix
 local write = io.write
 local pcall = pcall
 local phase
@@ -1284,7 +1628,7 @@ local jit = jit
 local var
 
 local _VERSION = _VERSION
-local _ENV = _ENV
+local _ENV = _ENV -- luacheck: globals _ENV
 local _G = _G
 
 local HTML_ENTITIES = {
@@ -1309,14 +1653,41 @@ local CODE_ENTITIES = {
 
 local VAR_PHASES
 
-local ok, newtab = pcall(require, "table.new")
-if not ok then newtab = function() return {} end end
+local ESC    = byte("\27")
+local NUL    = byte("\0")
+local HT     = byte("\t")
+local VT     = byte("\v")
+local LF     = byte("\n")
+local SOL    = byte("/")
+local BSOL   = byte("\\")
+local SP     = byte(" ")
+local AST    = byte("*")
+local NUM    = byte("#")
+local LPAR   = byte("(")
+local LSQB   = byte("[")
+local LCUB   = byte("{")
+local MINUS  = byte("-")
+local PERCNT = byte("%")
 
-local caching = true
-local template = newtab(0, 12)
+local EMPTY  = ""
 
-template._VERSION = "1.9"
-template.cache    = {}
+local VIEW_ENV
+if _VERSION == "Lua 5.1" then
+    VIEW_ENV = { __index = function(t, k)
+        return t.context[k] or t.template[k] or _G[k]
+    end }
+else
+    VIEW_ENV = { __index = function(t, k)
+        return t.context[k] or t.template[k] or _ENV[k]
+    end }
+end
+
+local newtab
+do
+    local ok
+    ok, newtab = pcall(require, "table.new")
+    if not ok then newtab = function() return {} end end
+end
 
 local function enabled(val)
     if val == nil then return true end
@@ -1324,13 +1695,13 @@ local function enabled(val)
 end
 
 local function trim(s)
-    return gsub(gsub(s, "^%s+", ""), "%s+$", "")
+    return gsub(gsub(s, "^%s+", EMPTY), "%s+$", EMPTY)
 end
 
 local function rpos(view, s)
     while s > 0 do
-        local c = sub(view, s, s)
-        if c == " " or c == "\t" or c == "\0" or c == "\x0B" then
+        local c = byte(view, s, s)
+        if c == SP or c == HT or c == VT or c == NUL then
             s = s - 1
         else
             break
@@ -1340,8 +1711,8 @@ local function rpos(view, s)
 end
 
 local function escaped(view, s)
-    if s > 1 and sub(view, s - 1, s - 1) == "\\" then
-        if s > 2 and sub(view, s - 2, s - 2) == "\\" then
+    if s > 1 and byte(view, s - 1, s - 1) == BSOL then
+        if s > 2 and byte(view, s - 2, s - 2) == BSOL then
             return false, 1
         else
             return true, 1
@@ -1350,391 +1721,577 @@ local function escaped(view, s)
     return false, 0
 end
 
-local function readfile(path)
-    local file = open(path, "rb")
-    if not file then return nil end
-    local content = file:read "*a"
+local function read_file(path)
+    local file, err = open(path, "rb")
+    if not file then return nil, err end
+    local content
+    content, err = file:read "*a"
     file:close()
+    return content, err
+end
+
+local print_view
+local load_view
+if ngx then
+    print_view = ngx.print or write
+
+    var = ngx.var
+    null = ngx.null
+    phase = ngx.get_phase
+
+    VAR_PHASES = {
+        set           = true,
+        rewrite       = true,
+        access        = true,
+        content       = true,
+        header_filter = true,
+        body_filter   = true,
+        log           = true,
+        preread       = true
+    }
+
+    local capture = ngx.location.capture
+    local prefix = ngx.config.prefix()
+    load_view = function(template)
+        return function(view, plain)
+            if plain == true then return view end
+            local vars = VAR_PHASES[phase()]
+            local path = view
+            local root = template.location
+            if (not root or root == EMPTY) and vars then
+                root = var.template_location
+            end
+            if root and root ~= EMPTY then
+                if byte(root, -1) == SOL then root = sub(root, 1, -2) end
+                if byte(path,  1) == SOL then path = sub(path, 2) end
+                path = root .. "/" .. path
+                local res = capture(path)
+                if res.status == 200 then return res.body end
+            end
+            path = view
+            root = template.root
+            if (not root or root == EMPTY) and vars then
+                root = var.template_root
+                if not root or root == EMPTY then root = var.document_root or prefix end
+            end
+            if root and root ~= EMPTY then
+                if byte(root, -1) == SOL then root = sub(root, 1, -2) end
+                if byte(path,  1) == SOL then path = sub(path, 2) end
+                path = root .. "/" .. path
+            end
+            return plain == false and assert(read_file(path)) or read_file(path) or view
+        end
+    end
+else
+    print_view = write
+    load_view = function(template)
+        return function(view, plain)
+            if plain == true then return view end
+            local path, root = view, template.root
+            if root and root ~= EMPTY then
+                if byte(root, -1) == SOL then root = sub(root, 1, -2) end
+                if byte(view,  1) == SOL then path = sub(view, 2) end
+                path = root .. "/" .. path
+            end
+            return plain == false and assert(read_file(path)) or read_file(path) or view
+        end
+    end
+end
+
+local function load_file(func)
+    return function(view) return func(view, false) end
+end
+
+local function load_string(func)
+    return function(view) return func(view, true) end
+end
+
+local loader
+if jit or _VERSION ~= "Lua 5.1" then
+    loader = function(template)
+        return function(view)
+            return assert(load(view, nil, nil, setmetatable({ template = template }, VIEW_ENV)))
+        end
+    end
+else
+    loader = function(template)
+        return function(view)
+            local func = assert(loadstring(view))
+            setfenv(func, setmetatable({ template = template }, VIEW_ENV))
+            return func
+        end
+    end
+end
+
+local function visit(visitors, content, tag, name)
+    if not visitors then
+        return content
+    end
+
+    for i = 1, visitors.n do
+        content = visitors[i](content, tag, name)
+    end
+
     return content
 end
 
-local function loadlua(path)
-    return readfile(path) or path
-end
+local function new(template, safe)
+    template = template or newtab(0, 26)
 
-local function loadngx(path)
-    local vars = VAR_PHASES[phase()]
-    local file, location = path, vars and var.template_location
-    if sub(file, 1)  == "/" then file = sub(file, 2) end
-    if location and location ~= "" then
-        if sub(location, -1) == "/" then location = sub(location, 1, -2) end
-        local res = capture(concat{ location, '/', file})
-        if res.status == 200 then return res.body end
-    end
-    local root = vars and (var.template_root or var.document_root) or prefix
-    if sub(root, -1) == "/" then root = sub(root, 1, -2) end
-    return readfile(concat{ root, "/", file }) or path
-end
+    template._VERSION    = "2.0"
+    template.cache       = {}
+    template.load        = load_view(template)
+    template.load_file   = load_file(template.load)
+    template.load_string = load_string(template.load)
+    template.print       = print_view
 
-do
-    if ngx then
-        VAR_PHASES = {
-            set           = true,
-            rewrite       = true,
-            access        = true,
-            content       = true,
-            header_filter = true,
-            body_filter   = true,
-            log           = true
-        }
-        template.print = ngx.print or write
-        template.load  = loadngx
-        prefix, var, capture, null, phase = ngx.config.prefix(), ngx.var, ngx.location.capture, ngx.null, ngx.get_phase
-        if VAR_PHASES[phase()] then
-            caching = enabled(var.template_cache)
-        end
+    local load_chunk = loader(template)
+
+    local caching
+    if VAR_PHASES and VAR_PHASES[phase()] then
+        caching = enabled(var.template_cache)
     else
-        template.print = write
-        template.load  = loadlua
+        caching = true
     end
-    if _VERSION == "Lua 5.1" then
-        local context = { __index = function(t, k)
-            return t.context[k] or t.template[k] or _G[k]
-        end }
-        if jit then
-            loadchunk = function(view)
-                return assert(load(view, nil, nil, setmetatable({ template = template }, context)))
+
+    local visitors
+    function template.visit(func)
+        if not visitors then
+            visitors = { func, n = 1 }
+            return
+        end
+        visitors.n = visitors.n + 1
+        visitors[visitors.n] = func
+    end
+
+    function template.caching(enable)
+        if enable ~= nil then caching = enable == true end
+        return caching
+    end
+
+    function template.output(s)
+        if s == nil or s == null then return EMPTY end
+        if type(s) == "function" then return template.output(s()) end
+        return tostring(s)
+    end
+
+    function template.escape(s, c)
+        if type(s) == "string" then
+            if c then return gsub(s, "[}{\">/<'&]", CODE_ENTITIES) end
+            return gsub(s, "[\">/<'&]", HTML_ENTITIES)
+        end
+        return template.output(s)
+    end
+
+    function template.new(view, layout)
+        local vt = type(view)
+
+        if vt == "boolean" then return new(nil,  view) end
+        if vt == "table"   then return new(view, safe) end
+        if vt == "nil"     then return new(nil,  safe) end
+
+        local render
+        local process
+        if layout then
+            if type(layout) == "table" then
+                render = function(self, context)
+                    context = context or self
+                    context.blocks = context.blocks or {}
+                    context.view = function(ctx) return template.process(view, ctx or context) end
+                    layout.blocks = context.blocks or {}
+                    layout.view = context.view or EMPTY
+                    layout:render()
+                end
+                process = function(self, context)
+                    context = context or self
+                    context.blocks = context.blocks or {}
+                    context.view = function(ctx) return template.process(view, ctx or context) end
+                    layout.blocks = context.blocks or {}
+                    layout.view = context.view
+                    return tostring(layout)
+                end
+            else
+                render = function(self, context)
+                    context = context or self
+                    context.blocks = context.blocks or {}
+                    context.view = function(ctx) return template.process(view, ctx or context) end
+                    template.render(layout, context)
+                end
+                process = function(self, context)
+                    context = context or self
+                    context.blocks = context.blocks or {}
+                    context.view = function(ctx) return template.process(view, ctx or context) end
+                    return template.process(layout, context)
+                end
             end
         else
-            loadchunk = function(view)
-                local func = assert(loadstring(view))
-                setfenv(func, setmetatable({ template = template }, context))
-                return func
+            render = function(self, context)
+                return template.render(view, context or self)
+            end
+            process = function(self, context)
+                return template.process(view, context or self)
             end
         end
-    else
-        local context = { __index = function(t, k)
-            return t.context[k] or t.template[k] or _ENV[k]
-        end }
-        loadchunk = function(view)
-            return assert(load(view, nil, nil, setmetatable({ template = template }, context)))
-        end
-    end
-end
 
-function template.caching(enable)
-    if enable ~= nil then caching = enable == true end
-    return caching
-end
-
-function template.output(s)
-    if s == nil or s == null then return "" end
-    if type(s) == "function" then return template.output(s()) end
-    return tostring(s)
-end
-
-function template.escape(s, c)
-    if type(s) == "string" then
-        if c then return gsub(s, "[}{\">/<'&]", CODE_ENTITIES) end
-        return gsub(s, "[\">/<'&]", HTML_ENTITIES)
-    end
-    return template.output(s)
-end
-
-function template.new(view, layout)
-    assert(view, "view was not provided for template.new(view, layout).")
-    local render, compile = template.render, template.compile
-    if layout then
-        if type(layout) == "table" then
-            return setmetatable({ render = function(self, context)
-                local context = context or self
-                context.blocks = context.blocks or {}
-                context.view = compile(view)(context)
-                layout.blocks = context.blocks or {}
-                layout.view = context.view or ""
-                return layout:render()
-            end }, { __tostring = function(self)
-                local context = self
-                context.blocks = context.blocks or {}
-                context.view = compile(view)(context)
-                layout.blocks = context.blocks or {}
-                layout.view = context.view
-                return tostring(layout)
-            end })
-        else
-            return setmetatable({ render = function(self, context)
-                local context = context or self
-                context.blocks = context.blocks or {}
-                context.view = compile(view)(context)
-                return render(layout, context)
-            end }, { __tostring = function(self)
-                local context = self
-                context.blocks = context.blocks or {}
-                context.view = compile(view)(context)
-                return compile(layout)(context)
+        if safe then
+            return setmetatable({
+                render = function(...)
+                    local ok, err = pcall(render, ...)
+                    if not ok then
+                        return nil, err
+                    end
+                end,
+                process = function(...)
+                    local ok, output = pcall(process, ...)
+                    if not ok then
+                        return nil, output
+                    end
+                    return output
+                end,
+             }, {
+                __tostring = function(...)
+                    local ok, output = pcall(process, ...)
+                    if not ok then
+                        return ""
+                    end
+                    return output
             end })
         end
-    end
-    return setmetatable({ render = function(self, context)
-        return render(view, context or self)
-    end }, { __tostring = function(self)
-        return compile(view)(self)
-    end })
-end
 
-function template.precompile(view, path, strip)
-    local chunk = dump(template.compile(view), strip ~= false)
-    if path then
-        local file = open(path, "wb")
-        file:write(chunk)
-        file:close()
+        return setmetatable({
+            render = render,
+            process = process
+        }, {
+            __tostring = process
+        })
     end
-    return chunk
-end
 
-function template.compile(view, key, plain)
-    assert(view, "view was not provided for template.compile(view, key, plain).")
-    if key == "no-cache" then
-        return loadchunk(template.parse(view, plain)), false
+    function template.precompile(view, path, strip, plain)
+        local chunk = dump(template.compile(view, nil, plain), strip ~= false)
+        if path then
+            local file = open(path, "wb")
+            file:write(chunk)
+            file:close()
+        end
+        return chunk
     end
-    key = key or view
-    local cache = template.cache
-    if cache[key] then return cache[key], true end
-    local func = loadchunk(template.parse(view, plain))
-    if caching then cache[key] = func end
-    return func, false
-end
 
-function template.parse(view, plain)
-    assert(view, "view was not provided for template.parse(view, plain).")
-    if not plain then
-        view = template.load(view)
-        if byte(view, 1, 1) == 27 then return view end
+    function template.precompile_string(view, path, strip)
+        return template.precompile(view, path, strip, true)
     end
-    local j = 2
-    local c = {[[
+
+    function template.precompile_file(view, path, strip)
+        return template.precompile(view, path, strip, false)
+    end
+
+    function template.compile(view, cache_key, plain)
+        assert(view, "view was not provided for template.compile(view, cache_key, plain)")
+        if cache_key == "no-cache" then
+            return load_chunk(template.parse(view, plain)), false
+        end
+        cache_key = cache_key or view
+        local cache = template.cache
+        if cache[cache_key] then return cache[cache_key], true end
+        local func = load_chunk(template.parse(view, plain))
+        if caching then cache[cache_key] = func end
+        return func, false
+    end
+
+    function template.compile_file(view, cache_key)
+        return template.compile(view, cache_key, false)
+    end
+
+    function template.compile_string(view, cache_key)
+        return template.compile(view, cache_key, true)
+    end
+
+    function template.parse(view, plain)
+        assert(view, "view was not provided for template.parse(view, plain)")
+        if plain ~= true then
+            view = template.load(view, plain)
+            if byte(view, 1, 1) == ESC then return view end
+        end
+        local j = 2
+        local c = {[[
 context=... or {}
-local function include(v, c) return template.compile(v)(c or context) end
 local ___,blocks,layout={},blocks or {}
+local function include(v, c) return template.process(v, c or context) end
+local function echo(...) for i=1,select("#", ...) do ___[#___+1] = tostring(select(i, ...)) end end
 ]] }
-    local i, s = 1, find(view, "{", 1, true)
-    while s do
-        local t, p = sub(view, s + 1, s + 1), s + 2
-        if t == "{" then
-            local e = find(view, "}}", p, true)
-            if e then
-                local z, w = escaped(view, s)
-                if i < s - w then
-                    c[j] = "___[#___+1]=[=[\n"
-                    c[j+1] = sub(view, i, s - 1 - w)
-                    c[j+2] = "]=]\n"
-                    j=j+3
-                end
-                if z then
-                    i = s
-                else
-                    c[j] = "___[#___+1]=template.escape("
-                    c[j+1] = trim(sub(view, p, e - 1))
-                    c[j+2] = ")\n"
-                    j=j+3
-                    s, i = e + 1, e + 2
-                end
-            end
-        elseif t == "*" then
-            local e = find(view, "*}", p, true)
-            if e then
-                local z, w = escaped(view, s)
-                if i < s - w then
-                    c[j] = "___[#___+1]=[=[\n"
-                    c[j+1] = sub(view, i, s - 1 - w)
-                    c[j+2] = "]=]\n"
-                    j=j+3
-                end
-                if z then
-                    i = s
-                else
-                    c[j] = "___[#___+1]=template.output("
-                    c[j+1] = trim(sub(view, p, e - 1))
-                    c[j+2] = ")\n"
-                    j=j+3
-                    s, i = e + 1, e + 2
-                end
-            end
-        elseif t == "%" then
-            local e = find(view, "%}", p, true)
-            if e then
-                local z, w = escaped(view, s)
-                if z then
+        local i, s = 1, find(view, "{", 1, true)
+        while s do
+            local t, p = byte(view, s + 1, s + 1), s + 2
+            if t == LCUB then
+                local e = find(view, "}}", p, true)
+                if e then
+                    local z, w = escaped(view, s)
                     if i < s - w then
                         c[j] = "___[#___+1]=[=[\n"
-                        c[j+1] = sub(view, i, s - 1 - w)
+                        c[j+1] = visit(visitors, sub(view, i, s - 1 - w))
                         c[j+2] = "]=]\n"
                         j=j+3
                     end
-                    i = s
-                else
-                    local n = e + 2
-                    if sub(view, n, n) == "\n" then
-                        n = n + 1
-                    end
-                    local r = rpos(view, s - 1)
-                    if i <= r then
-                        c[j] = "___[#___+1]=[=[\n"
-                        c[j+1] = sub(view, i, r)
-                        c[j+2] = "]=]\n"
-                        j=j+3
-                    end
-                    c[j] = trim(sub(view, p, e - 1))
-                    c[j+1] = "\n"
-                    j=j+2
-                    s, i = n - 1, n
-                end
-            end
-        elseif t == "(" then
-            local e = find(view, ")}", p, true)
-            if e then
-                local z, w = escaped(view, s)
-                if i < s - w then
-                    c[j] = "___[#___+1]=[=[\n"
-                    c[j+1] = sub(view, i, s - 1 - w)
-                    c[j+2] = "]=]\n"
-                    j=j+3
-                end
-                if z then
-                    i = s
-                else
-                    local f = sub(view, p, e - 1)
-                    local x = find(f, ",", 2, true)
-                    if x then
-                        c[j] = "___[#___+1]=include([=["
-                        c[j+1] = trim(sub(f, 1, x - 1))
-                        c[j+2] = "]=],"
-                        c[j+3] = trim(sub(f, x + 1))
-                        c[j+4] = ")\n"
-                        j=j+5
+                    if z then
+                        i = s
                     else
-                        c[j] = "___[#___+1]=include([=["
-                        c[j+1] = trim(f)
-                        c[j+2] = "]=])\n"
+                        c[j] = "___[#___+1]=template.escape("
+                        c[j+1] = visit(visitors, trim(sub(view, p, e - 1)), "{")
+                        c[j+2] = ")\n"
+                        j=j+3
+                        s, i = e + 1, e + 2
+                    end
+                end
+            elseif t == AST then
+                local e = find(view, "*}", p, true)
+                if e then
+                    local z, w = escaped(view, s)
+                    if i < s - w then
+                        c[j] = "___[#___+1]=[=[\n"
+                        c[j+1] = visit(visitors, sub(view, i, s - 1 - w))
+                        c[j+2] = "]=]\n"
                         j=j+3
                     end
-                    s, i = e + 1, e + 2
+                    if z then
+                        i = s
+                    else
+                        c[j] = "___[#___+1]=template.output("
+                        c[j+1] = visit(visitors, trim(sub(view, p, e - 1)), "*")
+                        c[j+2] = ")\n"
+                        j=j+3
+                        s, i = e + 1, e + 2
+                    end
                 end
-            end
-        elseif t == "[" then
-            local e = find(view, "]}", p, true)
-            if e then
-                local z, w = escaped(view, s)
-                if i < s - w then
-                    c[j] = "___[#___+1]=[=[\n"
-                    c[j+1] = sub(view, i, s - 1 - w)
-                    c[j+2] = "]=]\n"
-                    j=j+3
-                end
-                if z then
-                    i = s
-                else
-                    c[j] = "___[#___+1]=include("
-                    c[j+1] = trim(sub(view, p, e - 1))
-                    c[j+2] = ")\n"
-                    j=j+3
-                    s, i = e + 1, e + 2
-                end
-            end
-        elseif t == "-" then
-            local e = find(view, "-}", p, true)
-            if e then
-                local x, y = find(view, sub(view, s, e + 1), e + 2, true)
-                if x then
+            elseif t == PERCNT then
+                local e = find(view, "%}", p, true)
+                if e then
                     local z, w = escaped(view, s)
                     if z then
                         if i < s - w then
                             c[j] = "___[#___+1]=[=[\n"
-                            c[j+1] = sub(view, i, s - 1 - w)
+                            c[j+1] = visit(visitors, sub(view, i, s - 1 - w))
                             c[j+2] = "]=]\n"
                             j=j+3
                         end
                         i = s
                     else
-                        y = y + 1
-                        x = x - 1
-                        if sub(view, y, y) == "\n" then
-                            y = y + 1
+                        local n = e + 2
+                        if byte(view, n, n) == LF then
+                            n = n + 1
                         end
-                        local b = trim(sub(view, p, e - 1))
-                        if b == "verbatim" or b == "raw" then
-                            if i < s - w then
-                                c[j] = "___[#___+1]=[=[\n"
-                                c[j+1] = sub(view, i, s - 1 - w)
-                                c[j+2] = "]=]\n"
-                                j=j+3
-                            end
-                            c[j] = "___[#___+1]=[=["
-                            c[j+1] = sub(view, e + 2, x)
+                        local r = rpos(view, s - 1)
+                        if i <= r then
+                            c[j] = "___[#___+1]=[=[\n"
+                            c[j+1] = visit(visitors, sub(view, i, r))
                             c[j+2] = "]=]\n"
                             j=j+3
+                        end
+                        c[j] = visit(visitors, trim(sub(view, p, e - 1)), "%")
+                        c[j+1] = "\n"
+                        j=j+2
+                        s, i = n - 1, n
+                    end
+                end
+            elseif t == LPAR then
+                local e = find(view, ")}", p, true)
+                if e then
+                    local z, w = escaped(view, s)
+                    if i < s - w then
+                        c[j] = "___[#___+1]=[=[\n"
+                        c[j+1] = visit(visitors, sub(view, i, s - 1 - w))
+                        c[j+2] = "]=]\n"
+                        j=j+3
+                    end
+                    if z then
+                        i = s
+                    else
+                        local f = visit(visitors, sub(view, p, e - 1), "(")
+                        local x = find(f, ",", 2, true)
+                        if x then
+                            c[j] = "___[#___+1]=include([=["
+                            c[j+1] = trim(sub(f, 1, x - 1))
+                            c[j+2] = "]=],"
+                            c[j+3] = trim(sub(f, x + 1))
+                            c[j+4] = ")\n"
+                            j=j+5
                         else
-                            if sub(view, x, x) == "\n" then
-                                x = x - 1
-                            end
-                            local r = rpos(view, s - 1)
-                            if i <= r then
+                            c[j] = "___[#___+1]=include([=["
+                            c[j+1] = trim(f)
+                            c[j+2] = "]=])\n"
+                            j=j+3
+                        end
+                        s, i = e + 1, e + 2
+                    end
+                end
+            elseif t == LSQB then
+                local e = find(view, "]}", p, true)
+                if e then
+                    local z, w = escaped(view, s)
+                    if i < s - w then
+                        c[j] = "___[#___+1]=[=[\n"
+                        c[j+1] = visit(visitors, sub(view, i, s - 1 - w))
+                        c[j+2] = "]=]\n"
+                        j=j+3
+                    end
+                    if z then
+                        i = s
+                    else
+                        c[j] = "___[#___+1]=include("
+                        c[j+1] = visit(visitors, trim(sub(view, p, e - 1)), "[")
+                        c[j+2] = ")\n"
+                        j=j+3
+                        s, i = e + 1, e + 2
+                    end
+                end
+            elseif t == MINUS then
+                local e = find(view, "-}", p, true)
+                if e then
+                    local x, y = find(view, sub(view, s, e + 1), e + 2, true)
+                    if x then
+                        local z, w = escaped(view, s)
+                        if z then
+                            if i < s - w then
                                 c[j] = "___[#___+1]=[=[\n"
-                                c[j+1] = sub(view, i, r)
+                                c[j+1] = visit(visitors, sub(view, i, s - 1 - w))
                                 c[j+2] = "]=]\n"
                                 j=j+3
                             end
-                            c[j] = 'blocks["'
-                            c[j+1] = b
-                            c[j+2] = '"]=include[=['
-                            c[j+3] = sub(view, e + 2, x)
-                            c[j+4] = "]=]\n"
-                            j=j+5
+                            i = s
+                        else
+                            y = y + 1
+                            x = x - 1
+                            if byte(view, y, y) == LF then
+                                y = y + 1
+                            end
+                            local b = trim(sub(view, p, e - 1))
+                            if b == "verbatim" or b == "raw" then
+                                if i < s - w then
+                                    c[j] = "___[#___+1]=[=[\n"
+                                    c[j+1] = visit(visitors, sub(view, i, s - 1 - w))
+                                    c[j+2] = "]=]\n"
+                                    j=j+3
+                                end
+                                c[j] = "___[#___+1]=[=["
+                                c[j+1] = visit(visitors, sub(view, e + 2, x))
+                                c[j+2] = "]=]\n"
+                                j=j+3
+                            else
+                                if byte(view, x, x) == LF then
+                                    x = x - 1
+                                end
+                                local r = rpos(view, s - 1)
+                                if i <= r then
+                                    c[j] = "___[#___+1]=[=[\n"
+                                    c[j+1] = visit(visitors, sub(view, i, r))
+                                    c[j+2] = "]=]\n"
+                                    j=j+3
+                                end
+                                c[j] = 'blocks["'
+                                c[j+1] = b
+                                c[j+2] = '"]=include[=['
+                                c[j+3] = visit(visitors, sub(view, e + 2, x), "-", b)
+                                c[j+4] = "]=]\n"
+                                j=j+5
+                            end
+                            s, i = y - 1, y
                         end
-                        s, i = y - 1, y
+                    end
+                end
+            elseif t == NUM then
+                local e = find(view, "#}", p, true)
+                if e then
+                    local z, w = escaped(view, s)
+                    if i < s - w then
+                        c[j] = "___[#___+1]=[=[\n"
+                        c[j+1] = visit(visitors, sub(view, i, s - 1 - w))
+                        c[j+2] = "]=]\n"
+                        j=j+3
+                    end
+                    if z then
+                        i = s
+                    else
+                        e = e + 2
+                        if byte(view, e, e) == LF then
+                            e = e + 1
+                        end
+                        s, i = e - 1, e
                     end
                 end
             end
-        elseif t == "#" then
-            local e = find(view, "#}", p, true)
-            if e then
-                local z, w = escaped(view, s)
-                if i < s - w then
-                    c[j] = "___[#___+1]=[=[\n"
-                    c[j+1] = sub(view, i, s - 1 - w)
-                    c[j+2] = "]=]\n"
-                    j=j+3
-                end
-                if z then
-                    i = s
-                else
-                    e = e + 2
-                    if sub(view, e, e) == "\n" then
-                        e = e + 1
-                    end
-                    s, i = e - 1, e
-                end
-            end
+            s = find(view, "{", s + 1, true)
         end
-        s = find(view, "{", s + 1, true)
+        s = sub(view, i)
+        if s and s ~= EMPTY then
+            c[j] = "___[#___+1]=[=[\n"
+            c[j+1] = visit(visitors, s)
+            c[j+2] = "]=]\n"
+            j=j+3
+        end
+        c[j] = "return layout and include(layout,setmetatable({view=table.concat(___),blocks=blocks},{__index=context})) or table.concat(___)" -- luacheck: ignore
+        return concat(c)
     end
-    s = sub(view, i)
-    if s and s ~= "" then
-        c[j] = "___[#___+1]=[=[\n"
-        c[j+1] = s
-        c[j+2] = "]=]\n"
-        j=j+3
+
+    function template.parse_file(view)
+        return template.parse(view, false)
     end
-    c[j] = "return layout and include(layout,setmetatable({view=table.concat(___),blocks=blocks},{__index=context})) or table.concat(___)"
-    return concat(c)
+
+    function template.parse_string(view)
+        return template.parse(view, true)
+    end
+
+    function template.process(view, context, cache_key, plain)
+        assert(view, "view was not provided for template.process(view, context, cache_key, plain)")
+        return template.compile(view, cache_key, plain)(context)
+    end
+
+    function template.process_file(view, context, cache_key)
+        assert(view, "view was not provided for template.process_file(view, context, cache_key)")
+        return template.compile(view, cache_key, false)(context)
+    end
+
+    function template.process_string(view, context, cache_key)
+        assert(view, "view was not provided for template.process_string(view, context, cache_key)")
+        return template.compile(view, cache_key, true)(context)
+    end
+
+    function template.render(view, context, cache_key, plain)
+        assert(view, "view was not provided for template.render(view, context, cache_key, plain)")
+        template.print(template.process(view, context, cache_key, plain))
+    end
+
+    function template.render_file(view, context, cache_key)
+        assert(view, "view was not provided for template.render_file(view, context, cache_key)")
+        template.render(view, context, cache_key, false)
+    end
+
+    function template.render_string(view, context, cache_key)
+        assert(view, "view was not provided for template.render_string(view, context, cache_key)")
+        template.render(view, context, cache_key, true)
+    end
+
+    if safe then
+        return setmetatable({}, {
+            __index = function(_, k)
+                if type(template[k]) == "function" then
+                    return function(...)
+                        local ok, a, b = pcall(template[k], ...)
+                        if not ok then
+                            return nil, a
+                        end
+                        return a, b
+                    end
+                end
+                return template[k]
+            end,
+            __new_index = function(_, k, v)
+                template[k] = v
+            end,
+        })
+    end
+
+    return template
 end
 
-function template.render(view, context, key, plain)
-    assert(view, "view was not provided for template.render(view, context, key, plain).")
-    return template.print(template.compile(view, key, plain)(context))
-end
-
-return template
+return new()
 
 end,
 
